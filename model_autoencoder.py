@@ -216,7 +216,7 @@ class Mesh2SSM_AE(nn.Module):
         if array is None:
             self.template_dir = os.path.join(args.data_directory)
             
-            self.template = np.loadtxt(self.template_dir + "/"+args.template+".particles")/args.scale
+            self.template = np.loadtxt(self.template_dir + args.template+".particles")/args.scale
         else:
             self.template = array
             
