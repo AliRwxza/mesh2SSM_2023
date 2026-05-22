@@ -86,6 +86,7 @@ def geodescis(pos, face, k):
 	return idx
 
 def load_meshes_with_faces(directory, partition, extention,k):
+	print("Loading meshes with faces from directory: ", directory)
 	files = sorted(glob.glob(directory +  partition +"/*"+extention))
 	max_size = 0
 	vertices_all = []
@@ -95,7 +96,8 @@ def load_meshes_with_faces(directory, partition, extention,k):
 		with open(pk_filename, 'rb') as f:
 			idx_all = pickle.load(f)
 	except:
-		save = True
+		print("Precomputed geodesic indices not found. Computing geodesic indices for k =", k)
+		# save = True
 		idx_all = {}
 	
 	max_scale = 0
@@ -130,6 +132,7 @@ class MeshesWithFaces(Dataset):
 	def __init__(self, directory, partition='train',extention=".ply",k=10):
 		
 		self.data, self.idx_all, self.max_size, self.scale, self.filename = load_meshes_with_faces(directory, partition, extention,k)
+		print("Finished loading meshes with faces. Total meshes loaded: ", len(self.data))
 		self.partition = partition        
 
 	def __getitem__(self, item):

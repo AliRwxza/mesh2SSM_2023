@@ -34,7 +34,7 @@ def train(args):
 
     training_data = MeshesWithFaces(directory = args.data_directory, extention=args.extention,k=args.k)
     args.scale = training_data.scale
-    print(training_data.scale)
+    print(f"Training data scale: {training_data.scale}")
     train_loader = DataLoader(training_data, num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
     test_data = MeshesWithFaces(directory = args.data_directory, extention=args.extention, partition ='val',k=args.k)
@@ -47,13 +47,14 @@ def train(args):
     
    
     model = Mesh2SSM_AE(args)
+    print("Model Mesh2SSM_AE initialized successfully.")
     args.num_points = model.set_template(args)
     
 
     model_vae = VAE(args).double().to(device)
     num_steps = int(len(training_data)/args.batch_size)
-    print(str(model_vae))
-        
+    print(f"Number of training steps per epoch: {num_steps}")
+    print(f"Model VAE: {model_vae}")
     print("Let's use", torch.cuda.device_count(), "GPUs!")
     
     if args.use_sgd:
@@ -120,7 +121,7 @@ def train(args):
                     loss.backward()
                     opt_vae.step()
                     scheduler_vae.step()
-                    print(f'Epoch: {epoch}  VAE Training Loss: MSE: {MSE.detach().item() }, KLD: {KLD.detach().item() }')
+                    print(f'Epoch: {epoch}  VAE Training Loss: MSE: {MSE.detach().item() }, KLD: {KLD.detach().item() }', flush=True)
             
             if(epoch%2==0):
 
@@ -203,6 +204,14 @@ def train(args):
                 torch.save(model_vae.state_dict(), 'checkpoints/%s/models/model_vae.t7' % args.exp_name)
                 template = model.get_template()
                 np.savetxt('checkpoints/%s/models/best_template.txt' % args.exp_name, template)
+        
+        # 1. Your flushed print
+        print(f"Finished Epoch {epoch} successfully.", flush=True)
+
+        # 2. Write the pulse check to disk
+        progress_file = os.path.join('checkpoints', args.exp_name, 'last_successful_epoch.txt')
+        with open(progress_file, 'w') as f:
+            f.write(f"Code ran successfully up to the end of epoch: {epoch}\n")
 
         
     torch.save(model.state_dict(), 'checkpoints/%s/models/model_last.t7' % args.exp_name)
