@@ -97,7 +97,7 @@ def load_meshes_with_faces(directory, partition, extention,k):
 			idx_all = pickle.load(f)
 	except:
 		print("Precomputed geodesic indices not found. Computing geodesic indices for k =", k)
-		# save = True
+		save = True
 		idx_all = {}
 	
 	max_scale = 0
