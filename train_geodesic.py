@@ -24,6 +24,9 @@ from torch.utils.data import DataLoader
 from utils import prepare_logger, cd_loss_L1
 import sklearn.metrics as metrics
 from chamfer_distance import ChamferDistance
+from logger import get_logger
+
+log = get_logger(__name__)
 
 
 def _init_():
@@ -56,46 +59,53 @@ def train(args):
     Args:
         args: Namespace configurations containing epochs, batch sizes, lr, and data folders.
     """
+    log.info("train() called with args: %s", vars(args))
     # Initialize logger output directories and TensorBoard summary writers
     epochs_dir, log_fd, train_writer, val_writer = prepare_logger(args)
 
     # Load and scale input training dataset meshes
-    training_data = MeshesWithFaces(directory = args.data_directory, extention=args.extention, k=args.k)
-    args.scale = training_data.scale
-    print(f"Training data scale: {training_data.scale}")
+    with log.section("Loading training dataset"):
+        training_data = MeshesWithFaces(directory = args.data_directory, extention=args.extention, k=args.k)
+        args.scale = training_data.scale
+        log.info("Training data scale: %.6f", training_data.scale)
     
     train_loader = DataLoader(training_data, num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
                               
     # Load and scale validation dataset meshes
-    test_data = MeshesWithFaces(directory = args.data_directory, extention=args.extention, partition ='val', k=args.k)
-    args.test_scale = test_data.scale
+    with log.section("Loading validation dataset"):
+        test_data = MeshesWithFaces(directory = args.data_directory, extention=args.extention, partition ='val', k=args.k)
+        args.test_scale = test_data.scale
     test_loader = DataLoader(test_data, num_workers=8,
                              batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     # Detect CUDA GPU device support
     device = torch.device("cuda" if args.cuda else "cpu")
     args.device = device
+    log.info("Using device: %s", device)
     
     # Initialize autoencoder model and read reference template points
-    model = Mesh2SSM_AE(args)
-    print("Model Mesh2SSM_AE initialized successfully.")
-    args.num_points = model.set_template(args)
+    with log.section("Initialising Mesh2SSM_AE model"):
+        model = Mesh2SSM_AE(args)
+        log.info("Model Mesh2SSM_AE initialised successfully.")
+        args.num_points = model.set_template(args)
+        log.info("Template loaded: %d points", args.num_points)
     
     # Initialize shape VAE model
-    model_vae = VAE(args).double().to(device)
-    num_steps = int(len(training_data) / args.batch_size)
-    print(f"Number of training steps per epoch: {num_steps}")
-    print(f"Model VAE: {model_vae}")
-    print("Let's use", torch.cuda.device_count(), "GPUs!")
+    with log.section("Initialising VAE model"):
+        model_vae = VAE(args).double().to(device)
+        num_steps = int(len(training_data) / args.batch_size)
+        log.info("Steps per epoch: %d", num_steps)
+        log.info("VAE architecture:\n%s", model_vae)
+        log.info("GPUs available: %d", torch.cuda.device_count())
     
     # Choose optimization algorithms (Adam vs SGD)
     if args.use_sgd:
-        print("Use SGD")
+        log.info("Optimiser: SGD  lr=%.6f  momentum=%.3f", args.lr, args.momentum)
         opt = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=1e-4)
         opt_vae = optim.SGD(model_vae.parameters(), lr=args.vae_lr, momentum=args.momentum, weight_decay=1e-4)    
     else:
-        print("Use Adam")
+        log.info("Optimiser: Adam  lr=%.6f  vae_lr=%.6f", args.lr, args.vae_lr)
         opt = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
         opt_vae = optim.Adam(model_vae.parameters(), lr=args.vae_lr, betas=(0.9, 0.999))
         
@@ -113,6 +123,11 @@ def train(args):
     ae_burnin = 100                 # VAE is only trained after this epoch count to allow autoencoder initialization
     template_update_interval = 200  # Number of epochs between template reconstruction refreshes
     first_update_epoch = 400        # First epoch template updates are triggered
+
+    log.info("Training schedule:  total_epochs=%d (x2=%d)  ae_burnin=%d  "
+             "template_update_interval=%d  first_update_epoch=%d",
+             args.epochs, args.epochs * 2, ae_burnin,
+             template_update_interval, first_update_epoch)
 
     for epoch in range(args.epochs * 2):
         
@@ -137,8 +152,13 @@ def train(args):
             data = data.permute(0, 2, 1)  # shape: (B, 3, N) for EdgeConv
             batch_size = data.size()[0]
             
-            # Forward pass: predict correspondences and coarse reconstructions
-            particles, reconstruction = model(data, idx)
+            try:
+                # Forward pass: predict correspondences and coarse reconstructions
+                particles, reconstruction = model(data, idx)
+            except Exception as exc:
+                log.exception("Forward pass failed at epoch=%d step=%d: %s", epoch, step, exc)
+                log.gpu_snapshot("forward-pass-crash")
+                raise
             
             # --- VAE Training Epochs (Odd Epochs after Burn-In) ---
             if (epoch % 2 == 1):
@@ -159,7 +179,8 @@ def train(args):
                     loss.backward()
                     opt_vae.step()
                     scheduler_vae.step()
-                    print(f'Epoch: {epoch}  VAE Training Loss: MSE: {MSE.detach().item()}, KLD: {KLD.detach().item()}', flush=True)
+                    log.debug('Epoch %d [VAE]  MSE=%.6f  KLD=%.6f  total=%.6f',
+                              epoch, MSE.detach().item(), KLD.detach().item(), loss.detach().item())
             
             # --- Autoencoder Training Epochs (Even Epochs) ---
             if (epoch % 2 == 0):
@@ -187,12 +208,15 @@ def train(args):
                 train_writer.add_scalar('training loss', loss.detach().item(), step)
                 step += 1
                 
-                print(f'Epoch: {epoch}  Training Loss: {train_loss}')
+                log.debug('Epoch %d [AE]  step=%d  chamfer=%.6f  mse=%.6f  total=%.6f  alpha=%.3f',
+                          epoch, step, chamfer_loss.detach().item(),
+                          mse_loss.detach().item(), loss.detach().item(), alpha)
 
         # -----------------------------------------------------------------------
         # Phase 2: Template Updates (Re-synthesize template from VAE samples)
         # -----------------------------------------------------------------------
         if (epoch % template_update_interval == 0 and epoch >= first_update_epoch):
+            log.info("[Epoch %d] Updating template from VAE samples...", epoch)
             model_vae.eval()
             model.eval()
             with torch.no_grad():
@@ -209,7 +233,7 @@ def train(args):
             template = np.reshape(template, (args.num_points, 3))
             np.savetxt(args.pred_dir + "learned_template_" + str(epoch) + ".particles", template * args.scale)
             
-            print("Setting Template to new learned average.")
+            log.info("[Epoch %d] Template updated. New mean shape saved.", epoch)
             model.set_template(args, array=template)
             
         # -----------------------------------------------------------------------
@@ -220,6 +244,7 @@ def train(args):
             count = 0.0
             model.eval()
             model_vae.eval()
+            log.info("[Epoch %d] Running validation...", epoch)
             
             # Iterate through validation loader
             for data, idx, label, names in test_loader:
@@ -256,23 +281,31 @@ def train(args):
             # Checkpoint updates: save best model parameter weights if validation loss improves
             if test_loss <= best_test_dist:
                 best_test_dist = test_loss
+                log.info("[Epoch %d] New best val loss: %.6f  (prev: %.6f) - saving checkpoint.",
+                         epoch, test_loss, best_test_dist if best_test_dist < 10e5 else float('inf'))
                 torch.save(model.state_dict(), 'checkpoints/%s/models/model.t7' % args.exp_name)
                 torch.save(model_vae.state_dict(), 'checkpoints/%s/models/model_vae.t7' % args.exp_name)
                 template = model.get_template()
                 np.savetxt('checkpoints/%s/models/best_template.txt' % args.exp_name, template)
+            else:
+                log.info("[Epoch %d] Val loss: %.6f  (best: %.6f)", epoch, test_loss, best_test_dist)
         
         # Log successful completion of training epoch to checkpoints folder
-        print(f"Finished Epoch {epoch} successfully.", flush=True)
+        log.info("[Epoch %d] Finished successfully.  train_loss=%.6f  step=%d",
+                 epoch, train_loss, step)
+        log.gpu_snapshot(f"end-of-epoch-{epoch}")
 
         progress_file = os.path.join('checkpoints', args.exp_name, 'last_successful_epoch.txt')
         with open(progress_file, 'w') as f:
             f.write(f"Code ran successfully up to the end of epoch: {epoch}\n")
 
     # Save final model state checkpoints
+    log.info("Training complete. Saving final model checkpoints.")
     torch.save(model.state_dict(), 'checkpoints/%s/models/model_last.t7' % args.exp_name)
     torch.save(model_vae.state_dict(), 'checkpoints/%s/models/model_vae_last.t7' % args.exp_name)
     template = model.get_template()
     np.savetxt('checkpoints/%s/models/final_template.txt' % args.exp_name, template)
+    log.info("All done. Log file: %s", str(__import__('logger').get_log_path()))
 
 
 if __name__ == "__main__":
@@ -344,13 +377,20 @@ if __name__ == "__main__":
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     torch.manual_seed(args.seed)
     if args.cuda:
-        print('Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
+        log.info('Using GPU : %s from %d devices',
+                 str(torch.cuda.current_device()), torch.cuda.device_count())
         torch.cuda.manual_seed(args.seed)
     else:
-        print('Using CPU')
+        log.info('Using CPU')
 
     # Execute training loop
-    train(args)
+    log.info("=== Starting training loop ===")
+    try:
+        train(args)
+    except Exception as exc:
+        log.exception("Training loop crashed: %s", exc)
+        log.gpu_snapshot("training-crash")
+        raise
 
 
 '''

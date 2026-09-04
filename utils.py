@@ -10,6 +10,9 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import os
 from chamfer_distance import ChamferDistance
+from logger import get_logger
+
+log = get_logger(__name__)
 
 
 def make_dir(dir_path):
@@ -20,7 +23,10 @@ def make_dir(dir_path):
         dir_path (str): Path to the directory to be created.
     """
     if not os.path.exists(dir_path):
+        log.debug("Creating directory: %s", dir_path)
         os.makedirs(dir_path)
+    else:
+        log.debug("Directory already exists: %s", dir_path)
 
 def prepare_logger(params):
     """
@@ -55,10 +61,12 @@ def prepare_logger(params):
     # File path for the main text log file
     logger_file = os.path.join(params.log_dir, params.exp_name, params.model_type, 'logger.log')
     log_fd = open(logger_file, 'a')
+    log.info("Experiment log file: %s", logger_file)
 
     # Initialize TensorBoard SummaryWriters for training and validation metrics
     train_writer = SummaryWriter(os.path.join(logger_path, 'train'))
     val_writer = SummaryWriter(os.path.join(logger_path, 'val'))
+    log.info("TensorBoard writers initialised at: %s", logger_path)
 
     return epochs_dir, log_fd, train_writer, val_writer
 

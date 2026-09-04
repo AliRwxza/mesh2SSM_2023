@@ -14,6 +14,9 @@ from torch.utils.data import Dataset
 import pyvista as pv
 from torch_geometric.utils import geodesic_distance
 import torch
+from logger import get_logger
+
+log = get_logger(__name__)
 
 def download():
 	"""
@@ -150,6 +153,7 @@ def geodescis(pos, face, k):
 	Returns:
 	    idx (torch.Tensor): Indices of the k nearest geodesic neighbors of shape (V, k).
 	"""
+	log.debug("Computing geodesic distances: %d vertices, %d faces, k=%d", len(pos), len(face), k)
 	pos = torch.Tensor(pos)
 	face = torch.Tensor(face)
 	# Compute geodesic distances using torch_geometric. Face transpose transforms shape to (2, 3*F) or (3, F) representation
@@ -178,8 +182,10 @@ def load_meshes_with_faces(directory, partition, extention, k):
 	    max_scale (float): The maximum coordinate scale across all loaded meshes.
 	    filename (list of str): List of loaded mesh filenames.
 	         """
-	print("Loading meshes with faces from directory: ", directory)
+	log.info("Loading meshes with faces from directory: %s  partition=%s  ext=%s  k=%d",
+	         directory, partition, extention, k)
 	files = sorted(glob.glob(directory + partition + "/*" + extention))
+	log.info("Found %d mesh files", len(files))
 	max_size = 0
 	vertices_all = []
 	
@@ -189,8 +195,9 @@ def load_meshes_with_faces(directory, partition, extention, k):
 		save = False
 		with open(pk_filename, 'rb') as f:
 			idx_all = pickle.load(f)
-	except:
-		print("Precomputed geodesic indices not found. Computing geodesic indices for k =", k)
+		log.info("Loaded cached geodesic indices from: %s", pk_filename)
+	except Exception as e:
+		log.info("Geodesic cache not found (%s). Computing from scratch for k=%d ...", pk_filename, k)
 		save = True
 		idx_all = {}
 	
@@ -198,34 +205,45 @@ def load_meshes_with_faces(directory, partition, extention, k):
 	filename = []
 	
 	# Read meshes and record dimensions
-	for f in files:
-		mesh = pv.read(f)
-		name = f.split("/")[-1]
-		filename.append(name)
-		vertices = np.array(mesh.points).astype('double')
-		# Read face array, pyvista prepends number of vertices per face (usually 3 for triangles), so filter out the count indicator
-		faces = np.asarray(mesh.faces).reshape((-1, 4))[:, 1:]
-		
-		# Compute geodesic distances if no cache exists
-		if save:
-			idx = geodescis(vertices, faces, k)
-			idx_all[name] = idx
+	for i, f in enumerate(files):
+		try:
+			mesh = pv.read(f)
+			name = f.split("/")[-1]
+			filename.append(name)
+			vertices = np.array(mesh.points).astype('double')
+			# Read face array, pyvista prepends number of vertices per face (usually 3 for triangles), so filter out the count indicator
+			faces = np.asarray(mesh.faces).reshape((-1, 4))[:, 1:]
+			log.debug("[%d/%d] %s  vertices=%d  faces=%d",
+			          i + 1, len(files), name, len(vertices), len(faces))
+			
+			# Compute geodesic distances if no cache exists
+			if save:
+				log.debug("Computing geodesics for %s ...", name)
+				idx = geodescis(vertices, faces, k)
+				idx_all[name] = idx
 
-		# Keep track of absolute scale factor for normalization
-		scale = np.max(np.abs(vertices))
-		if scale > max_scale:
-			max_scale = scale
-		vertices_all.append(vertices)
-		
-		# Record maximum vertex size for pad-to-max padding
-		if len(vertices) > max_size:
-			max_size = len(vertices)
+			# Keep track of absolute scale factor for normalization
+			scale = np.max(np.abs(vertices))
+			if scale > max_scale:
+				max_scale = scale
+			vertices_all.append(vertices)
+			
+			# Record maximum vertex size for pad-to-max padding
+			if len(vertices) > max_size:
+				max_size = len(vertices)
+		except Exception as exc:
+			log.exception("Failed to load mesh file %s: %s", f, exc)
+			raise
 			
 	# Save the newly computed indices to pickle file
 	if save:
+		log.info("Saving geodesic indices to: %s", pk_filename)
 		with open(pk_filename, 'wb') as f:
 			pickle.dump(idx_all, f)
+		log.info("Geodesic indices saved successfully.")
 
+	log.info("Dataset summary: %d meshes  max_vertices=%d  max_scale=%.4f",
+	         len(vertices_all), max_size, max_scale)
 	return vertices_all, idx_all, max_size, max_scale, filename
 
 
@@ -235,32 +253,39 @@ class MeshesWithFaces(Dataset):
 	Resizes and pads point counts to match max_size so they can be loaded in uniform PyTorch batches.
 	"""
 	def __init__(self, directory, partition='train', extention=".ply", k=10):
+		log.info("Initialising MeshesWithFaces: partition=%s  ext=%s  k=%d", partition, extention, k)
 		self.data, self.idx_all, self.max_size, self.scale, self.filename = load_meshes_with_faces(directory, partition, extention, k)
-		print("Finished loading meshes with faces. Total meshes loaded: ", len(self.data))
+		log.info("MeshesWithFaces ready: %d meshes  max_size=%d  scale=%.4f",
+		         len(self.data), self.max_size, self.scale)
 		self.partition = partition        
 
 	def __getitem__(self, item):
-		name = self.filename[item]
-		pointcloud = self.data[item]
+		try:
+			name = self.filename[item]
+			pointcloud = self.data[item]
 
-		# Padding/duplication check: if mesh vertices are fewer than max_size, duplicate random vertices
-		excess = self.max_size - len(pointcloud)
-		list_idx = list(range(len(pointcloud)))
-		if excess > 0:
-			repeat_idx = np.random.randint(0, len(pointcloud), excess)
-			list_idx = list_idx + list(repeat_idx)
+			# Padding/duplication check: if mesh vertices are fewer than max_size, duplicate random vertices
+			excess = self.max_size - len(pointcloud)
+			list_idx = list(range(len(pointcloud)))
+			if excess > 0:
+				repeat_idx = np.random.randint(0, len(pointcloud), excess)
+				list_idx = list_idx + list(repeat_idx)
 
-		# Standardize scales across meshes: pointcloud coordinates / maximum scale
-		pointcloud = pointcloud[list_idx, :] / self.scale
-		
-		# Output label is identical to scaled pointcloud for reconstruction loss
-		label = pointcloud.copy()
-		
-		# Select and pad the geodesic indices for the sampled/padded vertices
-		idx = self.idx_all[name]
-		idx_extended = idx[list_idx]
-		
-		return pointcloud, idx_extended, label, name
+			# Standardize scales across meshes: pointcloud coordinates / maximum scale
+			pointcloud = pointcloud[list_idx, :] / self.scale
+			
+			# Output label is identical to scaled pointcloud for reconstruction loss
+			label = pointcloud.copy()
+			
+			# Select and pad the geodesic indices for the sampled/padded vertices
+			idx = self.idx_all[name]
+			idx_extended = idx[list_idx]
+			
+			return pointcloud, idx_extended, label, name
+		except Exception as exc:
+			log.exception("MeshesWithFaces.__getitem__ failed at index %d (file: %s): %s",
+			              item, self.filename[item] if item < len(self.filename) else '?', exc)
+			raise
 		
 	def __len__(self):
 		return len(self.data)
